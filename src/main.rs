@@ -60,6 +60,12 @@ struct Lab {
     debugger: DebuggerHandle,
     kernel: KernelHandle,
     journal: Journal,
+    tutor_context: std::sync::Mutex<TutorContextCursor>,
+}
+
+#[derive(Default)]
+struct TutorContextCursor {
+    terminal: String,
 }
 
 struct WriteupCapture {
@@ -277,16 +283,20 @@ async fn handle_client(state: &Arc<AppState>, command: ClientMessage) -> Result<
                 .await
         }
         ClientMessage::CodexSend { text } => {
-            let (debugger, terminal, kernel, config) = with_lab(state, |lab| {
+            let (debugger, terminal_delta, kernel, config) = with_lab(state, |lab| {
+                let terminal = lab.debugger.tutor_transcript();
+                let mut cursor = lab.tutor_context.lock().expect("tutor context lock");
+                let delta = terminal_delta(&cursor.terminal, &terminal, 8 * 1024);
+                cursor.terminal = terminal;
                 (
-                    lab.debugger.snapshot.borrow().clone(),
-                    lab.debugger.tutor_transcript(),
-                    lab.kernel.context_history(),
+                    compact_debugger(&lab.debugger.snapshot.borrow()),
+                    delta,
+                    lab.kernel.context_history(2),
                     lab.config.clone(),
                 )
             })
             .await?;
-            let context = json!({ "objective": config.objective, "target": { "workspace": config.workspace, "program": config.program, "args": config.args }, "debugger": debugger, "debuggerTerminal": { "format": "plain text with ANSI/control sequences removed", "tail": terminal }, "ipython": kernel });
+            let context = json!({ "objective": config.objective, "target": { "program": config.program, "args": config.args }, "debugger": debugger, "debuggerTerminal": { "format": "new plain text since the previous tutor turn; ANSI/control sequences removed", "delta": terminal_delta }, "recentIpPython": kernel });
             state
                 .codex
                 .command(CodexCommand::Send {
@@ -298,7 +308,17 @@ async fn handle_client(state: &Arc<AppState>, command: ClientMessage) -> Result<
         }
         ClientMessage::GenerateWriteup => generate_writeup(state).await,
         ClientMessage::CodexInterrupt => state.codex.command(CodexCommand::Interrupt).await,
-        ClientMessage::CodexNewThread => state.codex.command(CodexCommand::NewThread).await,
+        ClientMessage::CodexNewThread => {
+            let _ = with_lab(state, |lab| {
+                lab.tutor_context
+                    .lock()
+                    .expect("tutor context lock")
+                    .terminal
+                    .clear();
+            })
+            .await;
+            state.codex.command(CodexCommand::NewThread).await
+        }
         ClientMessage::AuthLogin => state.codex.command(CodexCommand::Login).await,
     }
 }
@@ -356,6 +376,7 @@ async fn start_lab(
         debugger: debugger.clone(),
         kernel: kernel.clone(),
         journal: journal.clone(),
+        tutor_context: std::sync::Mutex::new(TutorContextCursor::default()),
     };
     *state.lab.lock().await = Some(lab);
     forward_debugger(state.clone(), debugger, journal.clone());
@@ -537,6 +558,11 @@ fn forward_codex(state: Arc<AppState>) {
                             .await;
                     }
                 }
+                protocol::CodexEvent::TurnMetrics { .. } => {
+                    if let Some(journal) = &journal {
+                        journal.record("codex", "turnMetrics", &event).await;
+                    }
+                }
                 _ => {}
             }
             match &event {
@@ -640,4 +666,86 @@ fn emit_error(state: &Arc<AppState>, scope: &str, message: String) {
             message,
         },
     );
+}
+
+fn terminal_delta(previous: &str, current: &str, limit: usize) -> String {
+    let overlap = if current.starts_with(previous) {
+        previous.len()
+    } else {
+        previous
+            .char_indices()
+            .find_map(|(index, _)| {
+                current
+                    .starts_with(&previous[index..])
+                    .then_some(previous.len() - index)
+            })
+            .unwrap_or(0)
+    };
+    tail_chars(&current[overlap..], limit)
+}
+
+fn tail_chars(value: &str, limit: usize) -> String {
+    let start = value
+        .char_indices()
+        .rev()
+        .nth(limit)
+        .map_or(0, |(index, _)| index);
+    value[start..].to_owned()
+}
+
+fn compact_debugger(snapshot: &protocol::DebuggerSnapshot) -> serde_json::Value {
+    const KEY_REGISTERS: &[&str] = &[
+        "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rdi", "rsi", "r8", "r9",
+    ];
+    let registers: Vec<_> = snapshot
+        .registers
+        .iter()
+        .filter(|register| KEY_REGISTERS.contains(&register.name.as_str()))
+        .collect();
+    let instruction_index = snapshot
+        .frame
+        .as_ref()
+        .and_then(|frame| {
+            snapshot
+                .disassembly
+                .iter()
+                .position(|instruction| instruction.address == frame.address)
+        })
+        .unwrap_or(0);
+    let instruction_start = instruction_index.saturating_sub(4);
+    let instruction_end = (instruction_index + 8).min(snapshot.disassembly.len());
+    json!({
+        "revision": snapshot.revision,
+        "state": snapshot.state,
+        "stopReason": snapshot.stop_reason,
+        "stale": snapshot.stale,
+        "frame": snapshot.frame,
+        "frames": snapshot.frames.iter().take(5).collect::<Vec<_>>(),
+        "keyRegisters": registers,
+        "nearbyInstructions": &snapshot.disassembly[instruction_start..instruction_end],
+        "breakpoints": snapshot.breakpoints,
+        "stack": snapshot.stack,
+        "error": snapshot.error,
+    })
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::terminal_delta;
+
+    #[test]
+    fn terminal_context_only_returns_new_text() {
+        assert_eq!(
+            terminal_delta("pwndbg> check", "pwndbg> checksec\nFull RELRO\n", 8192),
+            "sec\nFull RELRO\n"
+        );
+    }
+
+    #[test]
+    fn terminal_context_handles_rolling_window_overlap() {
+        assert_eq!(
+            terminal_delta("old\nshared\n", "shared\nnew\n", 8192),
+            "new\n"
+        );
+    }
 }

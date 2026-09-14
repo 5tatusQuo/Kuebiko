@@ -176,16 +176,45 @@ pub enum KernelEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CodexEvent {
-    User { text: String },
-    Delta { text: String },
-    Completed { status: String },
-    Thread { thread_id: String },
-    LoginUrl { url: String },
-    Notice { text: String },
+    User {
+        text: String,
+    },
+    Delta {
+        text: String,
+    },
+    Completed {
+        status: String,
+    },
+    Thread {
+        thread_id: String,
+    },
+    LoginUrl {
+        url: String,
+    },
+    Notice {
+        text: String,
+    },
     WriteupStarted,
-    WriteupDelta { text: String },
-    WriteupCompleted { status: String },
-    WriteupSaved { path: String },
+    WriteupDelta {
+        text: String,
+    },
+    WriteupCompleted {
+        status: String,
+    },
+    WriteupSaved {
+        path: String,
+    },
+    Activity {
+        state: String,
+        detail: Option<String>,
+    },
+    TurnMetrics {
+        purpose: String,
+        context_bytes: usize,
+        acknowledgement_ms: Option<u64>,
+        first_response_ms: Option<u64>,
+        total_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

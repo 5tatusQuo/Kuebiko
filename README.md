@@ -24,7 +24,7 @@ The name comes from Kuebiko, the wise scarecrow deity of Japanese mythology: una
 - Rust, Tokio, and Axum on loopback.
 - pwndbg in a PTY for the human interface, plus a second GDB/MI UI for registers, frames, disassembly, breakpoints, and stack bytes.
 - ipykernel through the Jupyter messaging protocol. A small Python bridge uses `jupyter_client`; terminal output is never scraped.
-- `codex app-server` over JSONL JSON-RPC. The tutor receives structured state and a bounded, ANSI-stripped tail of the pwndbg terminal only when you send a chat message, so it can recognize commands and output you already saw. It is configured read-only, with approvals disabled, and cannot operate your debugger or kernel.
+- `codex app-server` over JSONL JSON-RPC. The tutor receives compact structured state, the two most recent IPython executions, and only the new ANSI-stripped pwndbg output since your previous message. Ordinary tutor turns use low reasoning effort and avoid tools unless you explicitly request an inspection. The UI streams activity and reports time-to-first-response, total latency, and context size after each turn.
 
 ## Setup
 

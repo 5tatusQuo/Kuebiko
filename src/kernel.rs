@@ -34,12 +34,12 @@ impl KernelHandle {
     pub async fn command(&self, command: KernelCommand) -> Result<()> {
         self.commands.send(command).await.context("kernel stopped")
     }
-    pub fn context_history(&self) -> Vec<KernelHistory> {
+    pub fn context_history(&self, limit: usize) -> Vec<KernelHistory> {
         self.history
             .borrow()
             .iter()
             .rev()
-            .take(8)
+            .take(limit)
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()
