@@ -8,6 +8,16 @@ A fast, local-first binary-exploitation learning workbench. Kuebiko combines a r
 
 The name comes from Kuebiko, the wise scarecrow deity of Japanese mythology: unable to walk, yet possessing knowledge of everything in the world. That makes it a fitting namesake for an observer that understands your debugging session without taking control of it.
 
+## Showcase
+
+### Start or resume a local lab
+
+![Kuebiko launch screen with workspace configuration and recent labs](docs/assets/kuebiko-launch-screen.png)
+
+### Debug with pwndbg, structured state, IPython, and the Codex tutor
+
+![Kuebiko debugging workbench showing pwndbg, registers, IPython, and tutor guidance](docs/assets/kuebiko-debugging-workbench.png)
+
 ## What it runs
 
 - SolidJS, TypeScript, Vite, and xterm.js in the browser.
