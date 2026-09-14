@@ -34,6 +34,7 @@ pub enum ClientMessage {
     KernelRestart,
     KernelInputReply { request_id: String, value: String },
     CodexSend { text: String },
+    GenerateWriteup,
     CodexInterrupt,
     CodexNewThread,
     AuthLogin,
@@ -181,6 +182,10 @@ pub enum CodexEvent {
     Thread { thread_id: String },
     LoginUrl { url: String },
     Notice { text: String },
+    WriteupStarted,
+    WriteupDelta { text: String },
+    WriteupCompleted { status: String },
+    WriteupSaved { path: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -245,5 +250,11 @@ mod tests {
             ClientMessage::KernelExecute { cell_id, code }
                 if cell_id == "cell-1" && code == "print(1)"
         ));
+    }
+
+    #[test]
+    fn parses_generate_writeup_command() {
+        let msg: ClientMessage = serde_json::from_str(r#"{"type":"generateWriteup"}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::GenerateWriteup));
     }
 }

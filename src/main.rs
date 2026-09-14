@@ -1,5 +1,6 @@
 mod codex;
 mod debugger;
+mod journal;
 mod kernel;
 mod mi;
 mod protocol;
@@ -33,8 +34,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use codex::{CodexCommand, CodexHandle};
+use codex::{CodexCommand, CodexHandle, TurnPurpose};
 use debugger::{DebuggerCommand, DebuggerHandle};
+use journal::Journal;
 use kernel::{KernelCommand, KernelHandle};
 use protocol::{
     ClientMessage, FullState, GDB_PTY_CHANNEL, LabConfig, LabStatus, ServerMessage, envelope,
@@ -57,6 +59,12 @@ struct Lab {
     config: LabConfig,
     debugger: DebuggerHandle,
     kernel: KernelHandle,
+    journal: Journal,
+}
+
+struct WriteupCapture {
+    journal: Journal,
+    markdown: String,
 }
 
 struct AppState {
@@ -67,6 +75,7 @@ struct AppState {
     pty: broadcast::Sender<Vec<u8>>,
     token: String,
     port: u16,
+    writeup: Mutex<Option<WriteupCapture>>,
 }
 
 #[tokio::main]
@@ -94,6 +103,7 @@ async fn main() -> Result<()> {
         pty,
         token: token.clone(),
         port,
+        writeup: Mutex::new(None),
     });
     forward_codex(state.clone());
 
@@ -196,7 +206,12 @@ async fn websocket(socket: WebSocket, state: Arc<AppState>) {
                     Err(error) => emit_error(&state, "protocol", error.to_string()),
                 },
                 Some(Ok(Message::Binary(data))) if data.first() == Some(&GDB_PTY_CHANNEL) => {
-                    if let Some(lab) = state.lab.lock().await.as_ref() { let _ = lab.debugger.command(DebuggerCommand::Input(data[1..].to_vec())).await; }
+                    let target = state.lab.lock().await.as_ref().map(|lab| (lab.debugger.clone(), lab.journal.clone()));
+                    if let Some((debugger, journal)) = target {
+                        let input = String::from_utf8_lossy(&data[1..]).into_owned();
+                        journal.record("pwndbg", "input", &json!({"text": input})).await;
+                        let _ = debugger.command(DebuggerCommand::Input(data[1..].to_vec())).await;
+                    }
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 _ => {}
@@ -274,9 +289,14 @@ async fn handle_client(state: &Arc<AppState>, command: ClientMessage) -> Result<
             let context = json!({ "objective": config.objective, "target": { "workspace": config.workspace, "program": config.program, "args": config.args }, "debugger": debugger, "debuggerTerminal": { "format": "plain text with ANSI/control sequences removed", "tail": terminal }, "ipython": kernel });
             state
                 .codex
-                .command(CodexCommand::Send { text, context })
+                .command(CodexCommand::Send {
+                    text,
+                    context,
+                    purpose: TurnPurpose::Tutor,
+                })
                 .await
         }
+        ClientMessage::GenerateWriteup => generate_writeup(state).await,
         ClientMessage::CodexInterrupt => state.codex.command(CodexCommand::Interrupt).await,
         ClientMessage::CodexNewThread => state.codex.command(CodexCommand::NewThread).await,
         ClientMessage::AuthLogin => state.codex.command(CodexCommand::Login).await,
@@ -312,7 +332,12 @@ async fn start_lab(
             return Err(error);
         }
     };
+    let resumed = existing_id.is_some();
     let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let journal = Journal::open(&id, &config).await?;
+    journal
+        .record("lab", "started", &json!({"resumed": resumed}))
+        .await;
     state
         .codex
         .command(CodexCommand::Configure {
@@ -330,10 +355,11 @@ async fn start_lab(
         config: config.clone(),
         debugger: debugger.clone(),
         kernel: kernel.clone(),
+        journal: journal.clone(),
     };
     *state.lab.lock().await = Some(lab);
-    forward_debugger(state.clone(), debugger);
-    forward_kernel(state.clone(), kernel);
+    forward_debugger(state.clone(), debugger, journal.clone());
+    forward_kernel(state.clone(), kernel, journal);
     emit(
         state,
         ServerMessage::LabStatus(LabStatus {
@@ -348,6 +374,7 @@ async fn start_lab(
 
 async fn stop_lab(state: &Arc<AppState>) {
     if let Some(lab) = state.lab.lock().await.take() {
+        lab.journal.record("lab", "stopped", &json!({})).await;
         let _ = lab.kernel.command(KernelCommand::Stop).await;
         let _ = lab.debugger.command(DebuggerCommand::Stop).await;
         emit(
@@ -360,15 +387,48 @@ async fn stop_lab(state: &Arc<AppState>) {
     }
 }
 
+async fn generate_writeup(state: &Arc<AppState>) -> Result<()> {
+    if state.writeup.lock().await.is_some() {
+        anyhow::bail!("a writeup is already being generated");
+    }
+    let (journal, config) =
+        with_lab(state, |lab| (lab.journal.clone(), lab.config.clone())).await?;
+    let events = journal.writeup_context().await?;
+    journal.record("writeup", "requested", &json!({})).await;
+    *state.writeup.lock().await = Some(WriteupCapture {
+        journal,
+        markdown: String::new(),
+    });
+    let prompt = "Create a polished Markdown blog writeup from this lab journal. Be technically accurate and chronological. Include: objective, protections/checksec findings, investigation, important debugger observations, vulnerability/root cause, exploit-development reasoning, final technique, and lessons learned. Use commands and outputs as evidence, but remove repetitive terminal redraws and tutor chatter. Do not invent successful steps or facts absent from the journal. Redact local home-directory prefixes and any apparent secrets. Return only the Markdown document.".to_owned();
+    let context = json!({"objective": config.objective, "target": {"program": config.program, "args": config.args}, "labJournalJsonl": events});
+    if let Err(error) = state
+        .codex
+        .command(CodexCommand::Send {
+            text: prompt,
+            context,
+            purpose: TurnPurpose::Writeup,
+        })
+        .await
+    {
+        *state.writeup.lock().await = None;
+        return Err(error);
+    }
+    Ok(())
+}
+
 async fn restart_kernel(state: &Arc<AppState>) -> Result<()> {
-    let (old, config) = with_lab(state, |lab| (lab.kernel.clone(), lab.config.clone())).await?;
+    let (old, config, journal) = with_lab(state, |lab| {
+        (lab.kernel.clone(), lab.config.clone(), lab.journal.clone())
+    })
+    .await?;
     old.command(KernelCommand::Stop).await?;
     let replacement = kernel::spawn(&config).await?;
     {
         let mut guard = state.lab.lock().await;
         guard.as_mut().context("lab stopped during restart")?.kernel = replacement.clone();
     }
-    forward_kernel(state.clone(), replacement);
+    journal.record("ipython", "restarted", &json!({})).await;
+    forward_kernel(state.clone(), replacement, journal);
     emit(
         state,
         ServerMessage::KernelEvent(protocol::KernelEvent::Restarted),
@@ -376,28 +436,55 @@ async fn restart_kernel(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-fn forward_debugger(state: Arc<AppState>, debugger: DebuggerHandle) {
+fn forward_debugger(state: Arc<AppState>, debugger: DebuggerHandle, journal: Journal) {
     let mut output = debugger.output.subscribe();
+    let initial_transcript = debugger.tutor_transcript();
     let pty = state.pty.clone();
+    let output_journal = journal.clone();
     tokio::spawn(async move {
+        if !initial_transcript.is_empty() {
+            output_journal
+                .record(
+                    "pwndbg",
+                    "initialTranscript",
+                    &json!({"text": initial_transcript}),
+                )
+                .await;
+        }
         while let Ok(data) = output.recv().await {
+            let text = debugger::strip_terminal_controls(&String::from_utf8_lossy(&data));
             let _ = pty.send(data);
+            if !text.is_empty() {
+                output_journal
+                    .record("pwndbg", "output", &json!({"text": text}))
+                    .await;
+            }
         }
     });
     let mut snapshots = debugger.snapshot.clone();
     let events = state.events.clone();
+    let snapshot_journal = journal;
     tokio::spawn(async move {
+        let initial_snapshot = snapshots.borrow().clone();
+        snapshot_journal
+            .record("gdbMi", "snapshot", &initial_snapshot)
+            .await;
         while snapshots.changed().await.is_ok() {
-            let _ = events.send(ServerMessage::DebuggerState(snapshots.borrow().clone()));
+            let snapshot = snapshots.borrow().clone();
+            let _ = events.send(ServerMessage::DebuggerState(snapshot.clone()));
+            snapshot_journal
+                .record("gdbMi", "snapshot", &snapshot)
+                .await;
         }
     });
 }
 
-fn forward_kernel(state: Arc<AppState>, kernel: KernelHandle) {
+fn forward_kernel(state: Arc<AppState>, kernel: KernelHandle, journal: Journal) {
     let mut source = kernel.events.subscribe();
     let events = state.events.clone();
     tokio::spawn(async move {
         while let Ok(event) = source.recv().await {
+            journal.record("ipython", "event", &event).await;
             let _ = events.send(ServerMessage::KernelEvent(event));
         }
     });
@@ -406,7 +493,89 @@ fn forward_kernel(state: Arc<AppState>, kernel: KernelHandle) {
 fn forward_codex(state: Arc<AppState>) {
     let mut source = state.codex.events.subscribe();
     tokio::spawn(async move {
+        let mut assistant_response = String::new();
         while let Ok(event) = source.recv().await {
+            let journal = state
+                .lab
+                .lock()
+                .await
+                .as_ref()
+                .map(|lab| lab.journal.clone());
+            match &event {
+                protocol::CodexEvent::User { text } => {
+                    if let Some(journal) = &journal {
+                        assistant_response.clear();
+                        journal
+                            .record("codex", "userMessage", &json!({"text": text}))
+                            .await;
+                    }
+                }
+                protocol::CodexEvent::Delta { text } => assistant_response.push_str(text),
+                protocol::CodexEvent::Completed { status } => {
+                    if let Some(journal) = &journal {
+                        journal
+                            .record(
+                                "codex",
+                                "assistantMessage",
+                                &json!({"text": assistant_response, "status": status}),
+                            )
+                            .await;
+                        assistant_response.clear();
+                    }
+                }
+                protocol::CodexEvent::Thread { thread_id } => {
+                    if let Some(journal) = &journal {
+                        journal
+                            .record("codex", "thread", &json!({"threadId": thread_id}))
+                            .await;
+                    }
+                }
+                protocol::CodexEvent::Notice { text } => {
+                    if let Some(journal) = &journal {
+                        journal
+                            .record("codex", "notice", &json!({"text": text}))
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+            match &event {
+                protocol::CodexEvent::WriteupDelta { text } => {
+                    if let Some(capture) = state.writeup.lock().await.as_mut() {
+                        capture.markdown.push_str(text);
+                    }
+                }
+                protocol::CodexEvent::WriteupCompleted { status } => {
+                    if let Some(capture) = state.writeup.lock().await.take() {
+                        if status == "completed" {
+                            match capture.journal.save_writeup(&capture.markdown).await {
+                                Ok(path) => {
+                                    capture
+                                        .journal
+                                        .record("writeup", "saved", &json!({"path": path}))
+                                        .await;
+                                    emit(
+                                        &state,
+                                        ServerMessage::CodexEvent(
+                                            protocol::CodexEvent::WriteupSaved {
+                                                path: path.display().to_string(),
+                                            },
+                                        ),
+                                    );
+                                }
+                                Err(error) => emit_error(&state, "writeup", error.to_string()),
+                            }
+                        } else {
+                            emit_error(
+                                &state,
+                                "writeup",
+                                format!("generation ended with status {status}"),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
             if let protocol::CodexEvent::Thread { thread_id } = &event
                 && let Some((id, config)) = {
                     state
@@ -419,11 +588,13 @@ fn forward_codex(state: Arc<AppState>) {
             {
                 let _ = state.store.put(id, config, Some(thread_id.clone())).await;
             }
-            emit(&state, ServerMessage::CodexEvent(event));
-            emit(
-                &state,
-                ServerMessage::AuthState(state.codex.auth.borrow().clone()),
-            );
+            if !matches!(event, protocol::CodexEvent::WriteupDelta { .. }) {
+                emit(&state, ServerMessage::CodexEvent(event));
+                emit(
+                    &state,
+                    ServerMessage::AuthState(state.codex.auth.borrow().clone()),
+                );
+            }
         }
     });
 }

@@ -43,6 +43,19 @@ The launch form defaults to the included development environment's buffer-overfl
 
 Only one lab runs at a time. Starting or resuming another lab stops the managed pwndbg and kernel children. Recent lab metadata and its Codex thread ID are stored atomically under the platform XDG state directory (normally `~/.local/state/kuebiko/state.json`) with owner-only permissions.
 
+## Lab journals and writeups
+
+Kuebiko automatically creates a durable journal for each lab under `~/.local/share/kuebiko/labs/<lab-id>/`. The journal includes timestamped pwndbg input and ANSI-stripped output, structured GDB/MI snapshots, IPython activity, Codex conversation events, and lab lifecycle events:
+
+```text
+<lab-id>/
+├── manifest.json
+├── events.jsonl
+└── writeup.md      # created on request
+```
+
+Select **Writeup** in the Codex tutor header to explicitly send up to the latest 2 MiB of journal data to Codex. Kuebiko generates a chronological Markdown blog draft, redacts local home-directory prefixes and apparent secrets, and saves it as `writeup.md`. Raw journal data remains separate and is not sent for writeup generation until you press the button.
+
 ## Development
 
 Build the frontend before running the Rust server, or run both processes while working on the UI:

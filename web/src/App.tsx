@@ -67,6 +67,8 @@ export default function App() {
     });
     if (event.kind === "completed") setChat((items) => items.map((item, index) => index === items.length - 1 ? { ...item, streaming: false } : item));
     if (event.kind === "notice") setChat((items) => [...items, { role: "notice", text: event.text }]);
+    if (event.kind === "writeupStarted") setChat((items) => [...items, { role: "notice", text: "Generating a Markdown writeup from the saved lab journal…" }]);
+    if (event.kind === "writeupSaved") setChat((items) => [...items, { role: "notice", text: `Writeup saved to ${event.path}` }]);
     if (event.kind === "loginUrl") window.open(event.url, "_blank", "noopener,noreferrer");
   }
 
@@ -89,7 +91,7 @@ export default function App() {
           }} onInterrupt={() => socket.send("kernelInterrupt")} onRestart={() => socket.send("kernelRestart")} />
         </section>
         <Inspector state={debuggerState()} tab={inspector()} setTab={setInspector} refresh={() => socket.send("debuggerRefresh")} />
-        <ChatPane chat={chat()} auth={auth()} send={(text) => socket.send("codexSend", { text })} interrupt={() => socket.send("codexInterrupt")} newThread={() => { setChat([]); socket.send("codexNewThread"); }} login={() => socket.send("authLogin")} />
+        <ChatPane chat={chat()} auth={auth()} send={(text) => socket.send("codexSend", { text })} generateWriteup={() => socket.send("generateWriteup")} interrupt={() => socket.send("codexInterrupt")} newThread={() => { setChat([]); socket.send("codexNewThread"); }} login={() => socket.send("authLogin")} />
       </main>
     </Show>
   </div>;
@@ -137,7 +139,7 @@ function Memory(props: { address?: string; bytes?: string }) {
   return <For each={rows()}>{(row) => <div class="memory"><code>{row.address}</code><span>{row.hex}</span></div>}</For>;
 }
 
-function ChatPane(props: { chat: Chat[]; auth: AuthState; send: (text: string) => void; interrupt: () => void; newThread: () => void; login: () => void }) {
+function ChatPane(props: { chat: Chat[]; auth: AuthState; send: (text: string) => void; generateWriteup: () => void; interrupt: () => void; newThread: () => void; login: () => void }) {
   const [text, setText] = createSignal("");
-  return <section class="panel chat-panel"><div class="panel-title"><h2>Codex tutor</h2><div><button onClick={props.newThread}>New chat</button><button onClick={props.interrupt}>Stop</button></div></div><Show when={props.auth.authenticated} fallback={<div class="login"><p>Sign in with your ChatGPT account to use Codex tutoring.</p><button class="primary" onClick={props.login}>Sign in</button></div>}><div class="messages"><Show when={!props.chat.length}><div class="empty-chat"><span>◎</span><p>Ask about what you see, request one hint, or check your reasoning.</p></div></Show><For each={props.chat}>{(item) => <article class={`message ${item.role}`}><b>{item.role === "assistant" ? "Tutor" : item.role === "user" ? "You" : "System"}</b><SafeMarkdown text={item.text} /></article>}</For></div><div class="composer chat-composer"><textarea value={text()} onInput={(e) => setText(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (text().trim()) { props.send(text()); setText(""); } } }} placeholder="Ask for one hint…" /><button class="primary" disabled={!text().trim()} onClick={() => { props.send(text()); setText(""); }}>Send</button></div></Show></section>;
+  return <section class="panel chat-panel"><div class="panel-title"><h2>Codex tutor</h2><div><button disabled={!props.auth.authenticated} title="Generate a Markdown writeup from this lab's journal" onClick={props.generateWriteup}>Writeup</button><button onClick={props.newThread}>New chat</button><button onClick={props.interrupt}>Stop</button></div></div><Show when={props.auth.authenticated} fallback={<div class="login"><p>Sign in with your ChatGPT account to use Codex tutoring.</p><button class="primary" onClick={props.login}>Sign in</button></div>}><div class="messages"><Show when={!props.chat.length}><div class="empty-chat"><span>◎</span><p>Ask about what you see, request one hint, or generate a writeup from the recorded lab journal.</p></div></Show><For each={props.chat}>{(item) => <article class={`message ${item.role}`}><b>{item.role === "assistant" ? "Tutor" : item.role === "user" ? "You" : "System"}</b><SafeMarkdown text={item.text} /></article>}</For></div><div class="composer chat-composer"><textarea value={text()} onInput={(e) => setText(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (text().trim()) { props.send(text()); setText(""); } } }} placeholder="Ask for one hint…" /><button class="primary" disabled={!text().trim()} onClick={() => { props.send(text()); setText(""); }}>Send</button></div></Show></section>;
 }

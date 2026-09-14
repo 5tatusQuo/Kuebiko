@@ -405,7 +405,7 @@ async fn handle_record(
     }
 }
 
-fn strip_terminal_controls(input: &str) -> String {
+pub(crate) fn strip_terminal_controls(input: &str) -> String {
     #[derive(Clone, Copy)]
     enum State {
         Text,
